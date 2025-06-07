@@ -233,7 +233,7 @@ if __name__ == "__main__":
 
         device = MJGUI(env=env)
     else:
-        raise Exception("Invalid device choice: choose either 'keyboard', 'dualsene' or 'spacemouse'.")
+        raise Exception("Invalid device choice: choose either 'keyboard', 'dualsene', 'spacemouse' or 'mjgui'.")
 
     while True:
         # Reset the environment
