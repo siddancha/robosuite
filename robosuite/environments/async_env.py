@@ -3,6 +3,7 @@ import logging
 import mujoco
 import multiprocessing as mp
 import queue
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -410,8 +411,70 @@ class SimulationWorker:
 
     @staticmethod
     def runner(conf: SimulationWorkerConf):
+        if sys.platform == "darwin" and conf.visualization_freq is not None:
+            SimulationWorker._run_with_main_thread_viewer(conf)
+        else:
+            worker = SimulationWorker(conf)
+            worker.main_loop()
+
+    @staticmethod
+    def _run_with_main_thread_viewer(conf: SimulationWorkerConf):
+        """macOS subprocess viewer workaround.
+
+        On macOS, GLFW/Cocoa requires that the viewer runs on the process's main
+        thread.  We install a custom ``_MJPYTHON`` dispatcher so that when the
+        simulation (running on a background thread) calls ``launch_passive``, the
+        actual GLFW initialisation is forwarded to the main thread via a queue.
+        """
+        import queue as stdlib_queue
+        from mujoco import viewer as mjviewer
+        from mujoco.viewer import _MjPythonBase, _launch_internal
+
+        dispatch_queue: stdlib_queue.Queue = stdlib_queue.Queue()
+
+        class _SubprocessMjPython(_MjPythonBase):
+            """Routes launch_passive viewer creation to the main thread."""
+            def launch_on_ui_thread(self, model, data, handle_return, key_callback,
+                                    show_left_ui=True, show_right_ui=True):
+                dispatch_queue.put((model, data, handle_return, key_callback,
+                                    show_left_ui, show_right_ui))
+
+        # Install our dispatcher so launch_passive takes the macOS path.
+        mjviewer._MJPYTHON = _SubprocessMjPython()
+
         worker = SimulationWorker(conf)
-        worker.main_loop()
+        sim_thread = threading.Thread(target=worker.main_loop, daemon=True)
+        sim_thread.start()
+
+        # Main thread: wait for the viewer-launch request from the simulation.
+        launch_args = None
+        while sim_thread.is_alive():
+            try:
+                launch_args = dispatch_queue.get(timeout=0.1)
+                break
+            except stdlib_queue.Empty:
+                continue
+
+        if launch_args is not None:
+            model, data, handle_return, key_callback, show_left_ui, show_right_ui = launch_args
+
+            # Clear _MJPYTHON so _launch_internal initialises GLFW normally.
+            mjviewer._MJPYTHON = None
+
+            # Run the GLFW event loop on the main thread (blocking) until
+            # the viewer window is closed.
+            _launch_internal(
+                model, data,
+                run_physics_thread=False,
+                handle_return=handle_return,
+                key_callback=key_callback,
+                show_left_ui=show_left_ui,
+                show_right_ui=show_right_ui,
+            )
+
+        # Viewer closed (or was never requested) — stop the simulation.
+        conf.stop_event.set()
+        sim_thread.join(timeout=10.0)
 
 
 class ObservationStream:
